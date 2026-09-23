@@ -121,7 +121,8 @@ AppKit 自动让它拖窗口、双击缩放，不需要改 DSH 一行 CSS。
 `stopServerOnQuit` 只对 Launcher 自己拉起的子进程生效。
 终端里那个、或只是被接管的那个，永远不会被它关掉。
 
-日志（排查启动失败用）：
+启动失败时窗口里有「重试」按钮，不需要读日志。
+日志（仍保留，供深入排查）：
 
 ```
 ~/Library/Application Support/DSHLauncher/launcher.log    # Launcher 的决策
@@ -203,3 +204,4 @@ MIT
 | v1.0.0 | 首发：原生壳跑 `dsh web`，不弹浏览器 |
 | v1.1.0 | **接管既有 DSH server**（用共享激活密钥签 cookie），修 app 与浏览器"不同步" |
 | v1.1.1 | 签发的 cookie 落盘持久化，第二次启动真正复用（不再每次重签） |
+| v1.2.0 | **修 Finder 启动失败**（`dsh` 是 `#!/usr/bin/env node`，而 GUI 进程 PATH 里没有 node → 退出 127）；自建子进程 PATH、预检 node、失败自动重试一次，并用「重试」按钮取代「去看日志」 |
