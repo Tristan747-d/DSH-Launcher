@@ -34,11 +34,18 @@ enum BrowserCookie {
     /// Mirrors DSH's own encoding exactly: base64url of the payload JSON, signed
     /// with HMAC-SHA256, serialized as `v1.<body>.<signature>` under the cookie
     /// name `dsh-auth-<sha256(authority) base64url>`.
-    static func cookieHeader(authority: String, lifetimeDays: Int = 30) throws -> String {
+    static func mint(authority: String, lifetimeDays: Int = 30)
+        throws -> (header: String, expiresAt: Date) {
         let secret = try activationSecret()
         let name = cookieName(authority: authority)
-        let value = try signedCookieValue(authority: authority, secret: secret, lifetimeDays: lifetimeDays)
-        return "\(name)=\(value)"
+        let minted = try signedCookieValue(authority: authority, secret: secret,
+                                           lifetimeDays: lifetimeDays)
+        return (header: "\(name)=\(minted.value)", expiresAt: minted.expiresAt)
+    }
+
+    /// Convenience for callers that only need the `Cookie:` header value.
+    static func cookieHeader(authority: String, lifetimeDays: Int = 30) throws -> String {
+        try mint(authority: authority, lifetimeDays: lifetimeDays).header
     }
 
     /// The cookie's name for one authority; also the name WebKit will store it under.
@@ -114,18 +121,20 @@ enum BrowserCookie {
     // MARK: - Cookie construction
 
     private static func signedCookieValue(authority: String, secret: Data,
-                                          lifetimeDays: Int) throws -> String {
+                                          lifetimeDays: Int) throws -> (value: String, expiresAt: Date) {
         let now = Int(Date().timeIntervalSince1970 * 1000)
         let lifetime = lifetimeDays * 24 * 60 * 60 * 1000
+        let expiresAtMs = now + lifetime
         // Key order and separators must match DSH's own JSON.stringify output,
         // because the signature is computed over the exact body bytes and the
         // server re-serializes nothing.
         let payload = "{\"version\":1,\"authority\":\"\(authority)\","
-            + "\"issuedAt\":\(now),\"expiresAt\":\(now + lifetime)}"
+            + "\"issuedAt\":\(now),\"expiresAt\":\(expiresAtMs)}"
         let body = base64URL(Data(payload.utf8))
         let key = SymmetricKey(data: secret)
         let mac = HMAC<SHA256>.authenticationCode(for: Data(body.utf8), using: key)
-        return "v1.\(body).\(base64URL(Data(mac)))"
+        return ("v1.\(body).\(base64URL(Data(mac)))",
+                Date(timeIntervalSince1970: Double(expiresAtMs) / 1000))
     }
 
     // MARK: - base64url

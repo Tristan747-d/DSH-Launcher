@@ -206,15 +206,17 @@ final class MainWindowController: NSWindowController {
                   .name: String(parts[0]),
                   .value: String(parts[1]),
                   .secure: "FALSE",
+                  // A *persistent* cookie, mirroring DSH's own `Max-Age`. Without
+                  // an expiry WebKit treats it as session-only and drops it on
+                  // quit, which would force a re-mint on every launch and defeat
+                  // the point of caching it here.
+                  .expires: pending.expiresAt,
               ])
         else {
             webView.load(URLRequest(url: target))
             return
         }
 
-        // A session cookie with no expiry is deliberate: DSH treats the signed
-        // payload's own `expiresAt` as authoritative, so the signature carries
-        // the real lifetime and WebKit need not duplicate it.
         let name = cookie.name
         webView.configuration.websiteDataStore.httpCookieStore.setCookie(cookie) { [weak self] in
             DispatchQueue.main.async {

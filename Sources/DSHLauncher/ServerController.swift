@@ -46,7 +46,9 @@ final class ServerController {
 
     /// A cookie minted for an adopted server, handed to the window so it can be
     /// injected into WebKit's cookie store before the first navigation.
-    private(set) var pendingCookie: (authority: String, header: String)?
+    /// `expiresAt` mirrors the signed payload's lifetime, so WebKit stores the
+    /// cookie persistently rather than dropping it at quit.
+    private(set) var pendingCookie: (authority: String, header: String, expiresAt: Date)?
 
     private let preferences: Preferences
     private var stdoutBuffer = Data()
@@ -151,8 +153,10 @@ final class ServerController {
                 //    never obtain, but the secret it verifies against is shared.
                 do {
                     let authority = "127.0.0.1:\(preferred)"
-                    let header = try BrowserCookie.cookieHeader(authority: authority)
-                    self.pendingCookie = (authority: authority, header: header)
+                    let minted = try BrowserCookie.mint(authority: authority)
+                    self.pendingCookie = (authority: authority,
+                                          header: minted.header,
+                                          expiresAt: minted.expiresAt)
                     Log.write("minted a browser-session cookie from the shared DSH "
                               + "activation secret for \(authority)")
                     self.adopt(port: preferred, completion: completion)
