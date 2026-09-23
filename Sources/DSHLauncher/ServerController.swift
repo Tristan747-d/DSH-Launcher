@@ -52,7 +52,10 @@ final class ServerController {
 
     private let preferences: Preferences
     private var stdoutBuffer = Data()
-    private let urlLine = DispatchSemaphore(value: 0)
+    private var urlLine = DispatchSemaphore(value: 0)
+    /// stderr lines from the current spawn attempt, shown verbatim when the
+    /// child dies before printing a URL.
+    private var attemptStderr: [String] = []
 
     init(preferences: Preferences) {
         self.preferences = preferences
@@ -184,8 +187,18 @@ final class ServerController {
     }
 
     /// Launch `dsh web --no-open --port <free port>` and wait for its URL line.
+    ///
+    /// Retries once on a fresh port. A startup failure is usually environmental
+    /// and transient (a port raced, a half-written config), and the user's whole
+    /// point in opening the app is that it Just Works — surfacing an error they
+    /// must act on is the failure mode this retry exists to avoid.
     private func spawn(preferredPort: Int,
                        completion: @escaping (Result<Outcome, Error>) -> Void) {
+        attemptSpawn(preferredPort: preferredPort, attemptsRemaining: 2, completion: completion)
+    }
+
+    private func attemptSpawn(preferredPort: Int, attemptsRemaining: Int,
+                              completion: @escaping (Result<Outcome, Error>) -> Void) {
         guard let port = choosePort(from: preferredPort) else {
             completion(.failure(LauncherError.noFreePort)); return
         }
@@ -193,10 +206,29 @@ final class ServerController {
             completion(.failure(LauncherError.dshNotFound)); return
         }
 
+        // Pre-flight: `dsh` is `#!/usr/bin/env node`, so with no interpreter on
+        // PATH the child dies instantly with an opaque exit 127. Failing here
+        // instead lets the error name the real cause.
+        guard let node = Self.resolveNodeInterpreter() else {
+            completion(.failure(LauncherError.nodeNotFound(Self.childEnvironment()["PATH"] ?? "")))
+            return
+        }
+        Log.write("using node interpreter \(node.path) for the dsh child")
+
+        // Fresh state per attempt: the previous attempt's output must not satisfy
+        // this one's URL wait.
+        urlLine = DispatchSemaphore(value: 0)
+        url = nil
+        token = nil
+        attemptStderr.removeAll()
+
         let child = Process()
         child.executableURL = executable
         child.arguments = ["web", "--no-open", "--port", String(port)]
         child.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        // The fix for the Finder-launch failure: the child gets a PATH containing
+        // the node location that `env node` needs.
+        child.environment = Self.childEnvironment()
 
         // stdout carries the tokenized URL; stderr carries configuration errors
         // that DSH prints before it ever gets as far as printing one.
@@ -211,13 +243,18 @@ final class ServerController {
             guard !data.isEmpty else { return }
             self?.consumeStdout(data)
         }
-        stderr.fileHandleForReading.readabilityHandler = { handle in
+        stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            for line in text.split(separator: "\n") { Log.write("dsh web stderr: \(line)") }
+            for line in text.split(separator: "\n") {
+                Log.write("dsh web stderr: \(line)")
+                self?.attemptStderr.append(String(line))
+            }
         }
         child.terminationHandler = { [weak self] proc in
             Log.write("dsh web exited with status \(proc.terminationStatus)")
+            // Wakes the URL wait so a crash is reported immediately rather than
+            // after the full timeout.
             self?.urlLine.signal()
         }
 
@@ -235,14 +272,25 @@ final class ServerController {
         // thread so the UI keeps drawing while the server boots.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let waited = self.urlLine.wait(timeout: .now() + 45)
+            let semaphore = self.urlLine
+            let waited = semaphore.wait(timeout: .now() + 45)
             let resolvedURL = self.url
             DispatchQueue.main.async {
-                if waited == .timedOut || resolvedURL == nil {
-                    completion(.failure(LauncherError.noUrlLine(self.logTail())))
-                } else if let resolvedURL {
+                if waited != .timedOut, let resolvedURL {
                     completion(.success(.started(url: resolvedURL, port: port)))
+                    return
                 }
+                // Failed. Try once more on a fresh port before giving up.
+                if attemptsRemaining > 1 {
+                    Log.write("dsh web did not come up on \(port); retrying on a new port")
+                    self.process = nil
+                    self.attemptSpawn(preferredPort: preferredPort,
+                                      attemptsRemaining: attemptsRemaining - 1,
+                                      completion: completion)
+                    return
+                }
+                completion(.failure(LauncherError.noUrlLine(self.attemptStderr
+                    .suffix(8).joined(separator: "\n"))))
             }
         }
     }
@@ -314,6 +362,64 @@ final class ServerController {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 
+    /// Build the PATH a Finder-launched child needs.
+    ///
+    /// **This is the fix for the `env: node: No such file or directory` failure.**
+    /// `dsh` starts with `#!/usr/bin/env node`, and on this machine `node` is
+    /// `~/.local/bin/node` → `~/.hermes/node/bin/node`, reachable only through an
+    /// interactive shell's PATH. A GUI app launched from Finder inherits a minimal
+    /// PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), so `env node` failed and `dsh` died
+    /// with status 127 before it could print a URL — which is exactly what
+    /// "dsh web 没有输出监听地址" was reporting.
+    ///
+    /// Rather than shelling out to a login shell, the known install locations are
+    /// prepended explicitly. That keeps startup fast, keeps the user's rc files
+    /// out of the app's process tree, and makes the behaviour reproducible.
+    static func childEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let home = FileManager.default.homeDirectoryForCurrentUser
+
+        // The interpreter locations that actually matter on a typical macOS
+        // install: the harness's own node, Homebrew, and the usual system bins.
+        let prepend = [
+            home.appendingPathComponent(".local/bin").path,
+            home.appendingPathComponent(".hermes/node/bin").path,
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin"
+        ]
+        let existing = (env["PATH"] ?? "").split(separator: ":").map(String.init)
+        var seen = Set<String>()
+        let merged = (prepend + existing).filter { seen.insert($0).inserted }
+        env["PATH"] = merged.joined(separator: ":")
+        // The same fallback the shell would provide, so a tool that reads HOME
+        // cannot see a stripped value.
+        if env["HOME"] == nil { env["HOME"] = home.path }
+        return env
+    }
+
+    /// Resolve the node interpreter that `dsh`'s `#!/usr/bin/env node` will find.
+    ///
+    /// Used for a *pre-flight* check so the failure is reported against the real
+    /// cause ("no node on PATH") instead of as an opaque exit 127. Returns nil
+    /// when no interpreter is reachable, meaning the child cannot possibly start.
+    static func resolveNodeInterpreter() -> URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        var candidates: [URL] = []
+        if let override = ProcessInfo.processInfo.environment["DSH_LAUNCHER_NODE_PATH"],
+           !override.isEmpty {
+            candidates.append(URL(fileURLWithPath: override))
+        }
+        candidates.append(contentsOf: [
+            home.appendingPathComponent(".local/bin/node"),
+            home.appendingPathComponent(".hermes/node/bin/node"),
+            URL(fileURLWithPath: "/opt/homebrew/bin/node"),
+            URL(fileURLWithPath: "/usr/local/bin/node"),
+            URL(fileURLWithPath: "/usr/bin/node")
+        ])
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
     /// Tail of the mirrored server log, for a startup error. A failed
     /// `dsh web --no-open --port N` prints its reason there.
     func logTail(_ lines: Int = 12) -> String {
@@ -321,6 +427,22 @@ final class ServerController {
               let text = String(data: data, encoding: .utf8)
         else { return "" }
         return text.split(separator: "\n").suffix(lines).joined(separator: "\n")
+    }
+
+    // MARK: - Retry
+
+    /// Clear per-attempt state so a user-requested retry starts clean.
+    ///
+    /// A previously spawned child is deliberately left running: if it is alive
+    /// but merely failed to report a URL, killing it could take down a server a
+    /// browser is already using. The retry picks a fresh port instead.
+    func reset() {
+        url = nil
+        token = nil
+        pendingCookie = nil
+        attemptStderr.removeAll()
+        stdoutBuffer.removeAll()
+        urlLine = DispatchSemaphore(value: 0)
     }
 
     // MARK: - Stopping
@@ -341,18 +463,31 @@ final class ServerController {
 
 enum LauncherError: LocalizedError {
     case dshNotFound
+    case nodeNotFound(String)
     case noFreePort
     case noUrlLine(String)
+
+    /// Whether retrying is worth the user's time. Errors from a missing
+    /// interpreter or binary are configuration problems a retry cannot fix, and
+    /// the window offers a retry button only when this is true.
+    var isRetryable: Bool {
+        switch self {
+        case .noUrlLine, .noFreePort: return true
+        case .dshNotFound, .nodeNotFound: return false
+        }
+    }
 
     var errorDescription: String? {
         switch self {
         case .dshNotFound:
             return "找不到 dsh 命令。"
+        case .nodeNotFound:
+            return "找不到 node —— dsh 需要它才能启动。"
         case .noFreePort:
             return "没有可用端口。"
         case .noUrlLine(let tail):
-            return tail.isEmpty ? "dsh web 没有输出监听地址。"
-                                : "dsh web 启动失败：\n\(tail)"
+            return tail.isEmpty ? "DSH 服务启动超时。"
+                                : "DSH 服务启动失败：\n\(tail)"
         }
     }
 
@@ -361,11 +496,14 @@ enum LauncherError: LocalizedError {
         case .dshNotFound:
             return "请确认已安装 dsh（一般是 ~/.local/bin/dsh），或用环境变量 "
                  + "DSH_LAUNCHER_DSH_PATH 指定它的完整路径。"
+        case .nodeNotFound(let path):
+            return "dsh 的启动脚本是 `#!/usr/bin/env node`，所以 node 必须在 PATH 上。\n"
+                 + "App 已尝试的 PATH：\(path.isEmpty ? "<空>" : path)\n"
+                 + "装一个 node（如 `brew install node`），或用 DSH_LAUNCHER_NODE_PATH 指定。"
         case .noFreePort:
             return "在设置文件里换一个 preferredPort，或关掉占用端口的程序。"
         case .noUrlLine:
-            return "详见 ~/Library/Application Support/DSHLauncher/ 下的 "
-                 + "launcher.log 与 dsh-web.log。"
+            return "点「重试」会重新启动服务；多次失败再看日志目录。"
         }
     }
 

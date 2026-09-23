@@ -24,6 +24,7 @@ final class MainWindowController: NSWindowController {
     private let controller: ServerController
     private var webView: WKWebView!
     private var statusLabel: NSTextField!
+    private var retryButton: NSButton!
 
     /// Height of the native drag strip. 30pt comfortably contains the standard
     /// 28pt titlebar band the traffic lights are drawn into.
@@ -110,6 +111,15 @@ final class MainWindowController: NSWindowController {
         container.addSubview(label)
         self.statusLabel = label
 
+        // Only revealed when startup fails and retrying can plausibly help.
+        let button = NSButton(title: "重试", target: self, action: #selector(retryStartup(_:)))
+        button.bezelStyle = .rounded
+        button.keyEquivalent = "\r"
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.isHidden = true
+        container.addSubview(button)
+        self.retryButton = button
+
         NSLayoutConstraint.activate([
             strip.topAnchor.constraint(equalTo: container.topAnchor),
             strip.leadingAnchor.constraint(equalTo: container.leadingAnchor),
@@ -122,7 +132,9 @@ final class MainWindowController: NSWindowController {
             webView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
 
             label.centerXAnchor.constraint(equalTo: webView.centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: webView.centerYAnchor),
+            label.centerYAnchor.constraint(equalTo: webView.centerYAnchor, constant: -24),
+            button.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 18),
+            button.centerXAnchor.constraint(equalTo: webView.centerXAnchor),
             label.widthAnchor.constraint(lessThanOrEqualToConstant: 620)
         ])
 
@@ -141,10 +153,12 @@ final class MainWindowController: NSWindowController {
             switch result {
             case .success(.started(let url, let port)):
                 Log.write("loading harness on port \(port) with a fresh token")
+                self.retryButton.isHidden = true
                 self.statusLabel.stringValue = "正在加载界面…"
                 self.webView.load(URLRequest(url: url))
             case .success(.adopted(let port)):
                 Log.write("loading harness on port \(port) (adopted server)")
+                self.retryButton.isHidden = true
                 self.statusLabel.stringValue = "正在连接已在运行的 DSH…"
                 // A minted cookie must land in WebKit's store *before* the first
                 // navigation, otherwise the load hits the 401 fence and the
@@ -153,9 +167,22 @@ final class MainWindowController: NSWindowController {
             case .failure(let error):
                 let body = (error as? LauncherError)?.localizedBody ?? error.localizedDescription
                 Log.write("startup failed: \(body)")
-                self.showFailure(body)
+                self.showFailure(body,
+                                 retryable: (error as? LauncherError)?.isRetryable ?? true)
             }
         })
+    }
+
+    /// Restart the server from scratch. This is the whole point of the app, so a
+    /// failure is recoverable in one click rather than by reading a log and
+    /// relaunching by hand.
+    @objc func retryStartup(_ sender: Any?) {
+        Log.write("retrying startup on user request")
+        retryButton.isHidden = true
+        statusLabel.textColor = NSColor(calibratedWhite: 0.78, alpha: 1)
+        statusLabel.stringValue = "正在重新启动 DSH…"
+        controller.reset()
+        start()
     }
 
     /// Ask WebKit's cookie store for `dsh-auth-…` and try it against `port`.
@@ -226,12 +253,17 @@ final class MainWindowController: NSWindowController {
         }
     }
 
-    private func showFailure(_ body: String) {
+    /// Show a failure without turning it into a dead end.
+    ///
+    /// The app's entire reason to exist is "open it and the harness is there", so
+    /// an error that only tells the user to go read a log file is a bug in itself.
+    /// A retry button is offered whenever retrying could plausibly work, and the
+    /// log path is secondary rather than the instruction.
+    private func showFailure(_ body: String, retryable: Bool) {
         statusLabel.isHidden = false
         statusLabel.textColor = NSColor(calibratedRed: 1, green: 0.45, blue: 0.4, alpha: 1)
         statusLabel.stringValue = body
-            + "\n\n修好后重新打开本 App 即可。日志目录：\n"
-            + Preferences.directory.path
+        retryButton.isHidden = !retryable
     }
 
     // MARK: - Window menu actions
@@ -307,7 +339,7 @@ extension MainWindowController: WKNavigationDelegate {
         // -1004 cannot-connect means the server died under us; say so plainly
         // instead of leaving WebKit's English error page on a dark window.
         if ns.code == NSURLErrorCannotConnectToHost {
-            showFailure("DSH 服务已断开。\n\n重新打开本 App 会重新启动服务。")
+            showFailure("DSH 服务已断开。", retryable: true)
         }
     }
 
