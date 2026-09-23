@@ -44,6 +44,10 @@ final class ServerController {
     private(set) var token: String?
     private(set) var port: Int?
 
+    /// A cookie minted for an adopted server, handed to the window so it can be
+    /// injected into WebKit's cookie store before the first navigation.
+    private(set) var pendingCookie: (authority: String, header: String)?
+
     private let preferences: Preferences
     private var stdoutBuffer = Data()
     private let urlLine = DispatchSemaphore(value: 0)
@@ -97,6 +101,18 @@ final class ServerController {
 
     /// Decide between reusing a listening server and spawning a child, then
     /// resolve the URL the window should load. `completion` always runs on main.
+    ///
+    /// **Adoption is the default and the point.** DSH's browser-session secret is
+    /// shared across processes, so a server the user started by hand in a
+    /// terminal is one this app can authenticate against. Adopting it is what
+    /// keeps the app window and the browser window on a *single* harness — and
+    /// therefore a single in-memory session state. Starting a second server would
+    /// split that state in two, which is the whole failure this avoids.
+    ///
+    /// A private server is still the fallback for the cases where adoption is
+    /// genuinely impossible: the port is held by a non-DSH process, the
+    /// credentials document is missing or malformed, or the user turned
+    /// `adoptExistingServer` off.
     func start(cookieProbe: @escaping CookieProbe,
                completion: @escaping (Result<Outcome, Error>) -> Void) {
         let preferred = preferences.preferredPort
@@ -120,20 +136,47 @@ final class ServerController {
                 self.spawn(preferredPort: preferred, completion: completion)
                 return
             }
-            cookieProbe(preferred) { authenticated in
-                if authenticated {
-                    Log.write("adopting the DSH server already listening on \(preferred) "
-                              + "(saved cookie accepted; external process left untouched)")
-                    self.port = preferred
-                    self.url = URL(string: "http://127.0.0.1:\(preferred)/")
-                    completion(.success(.adopted(port: preferred)))
-                } else {
-                    Log.write("port \(preferred) is held by a DSH server this app cannot "
-                              + "authenticate; starting a private server")
+
+            // 1. A cookie already in this app's WebKit store may still be valid.
+            cookieProbe(preferred) { storedCookieWorks in
+                if storedCookieWorks {
+                    Log.write("adopting the DSH server on \(preferred) with the stored cookie")
+                    self.adopt(port: preferred, completion: completion)
+                    return
+                }
+
+                // 2. Mint one from the shared activation secret. This is the
+                //    normal path when adopting a server this app did not start:
+                //    such a server mints its own process token, which we can
+                //    never obtain, but the secret it verifies against is shared.
+                do {
+                    let authority = "127.0.0.1:\(preferred)"
+                    let header = try BrowserCookie.cookieHeader(authority: authority)
+                    self.pendingCookie = (authority: authority, header: header)
+                    Log.write("minted a browser-session cookie from the shared DSH "
+                              + "activation secret for \(authority)")
+                    self.adopt(port: preferred, completion: completion)
+                } catch {
+                    // Not fatal: a private server still works, it just cannot
+                    // share state with whatever is on `preferred`.
+                    let reason = (error as? LocalizedError)?.errorDescription
+                        ?? error.localizedDescription
+                    Log.write("cannot authenticate the DSH server on \(preferred) "
+                              + "(\(reason)); starting a private server instead — the app "
+                              + "and any browser on \(preferred) will NOT share session state")
                     self.spawn(preferredPort: preferred, completion: completion)
                 }
             }
         }
+    }
+
+    /// Record the adopted port and finish, loading `/` (the cookie is injected
+    /// into WebKit's store before the window navigates).
+    private func adopt(port: Int,
+                       completion: @escaping (Result<Outcome, Error>) -> Void) {
+        self.port = port
+        self.url = URL(string: "http://127.0.0.1:\(port)/")
+        completion(.success(.adopted(port: port)))
     }
 
     /// Launch `dsh web --no-open --port <free port>` and wait for its URL line.

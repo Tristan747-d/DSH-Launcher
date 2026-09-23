@@ -40,23 +40,41 @@ App 启动时：
 
 ### token 与 cookie（为什么第二次启动更快）
 
-带 token 访问首页时，DSH 会 30 天有效的 `dsh-auth-…` cookie 并 303 跳到干净的 `/`。
+带 token 访问首页时，DSH 会签发一个 30 天有效的 `dsh-auth-…` cookie 并 303 跳到干净的 `/`。
 Launcher 用一个**固定 ID 的 `WKWebsiteDataStore`** 持久保存它，所以：
 
 - 第一次启动：用 token 换 cookie；
 - 之后启动：cookie 还在，直接就能打开。
 
-### 已经在跑的 3080 怎么办
+### 已经在跑的 3080 怎么办（**关键：这里决定同步与否**）
 
-如果 3080 上已经有 DSH（比如你自己在终端开的），Launcher 会：
+如果 3080 上已经有 DSH（比如你自己在终端里开的），Launcher 按顺序做三件事：
 
 1. 探测它是不是 DSH（`GET /` 是否返回 401/303/200）；
-2. 拿自己保存的 cookie 去试一次——**通过才接管**；
-3. 通不过（别人的进程、token 不同）就自己在 3081 起一个，
-   **绝不动你终端里的那个**。
+2. 拿**自己 WebKit 里已存的** cookie 试一次；
+3. 不行就**用共享的激活密钥现签一个 cookie**（见下），接管它。
 
-这是刻意的：终端里那个 server 的 token 是进程级的，Launcher 拿不到，
-所以它没有资格假设自己能用。宁多起一个，也不抢你的会话。
+第 3 步是这里最重要的设计，因为它决定了 app 和浏览器**是不是同一个会话**。
+
+#### 为什么能签得出可用的 cookie
+
+DSH 把浏览器会话密钥存在 **`$DSH_HOME/.credentials.yaml`** 的
+`client-connection/browser-session` 记录里，而**这个文件是所有 DSH 进程共享的**；
+cookie 本身只绑定请求 authority（`127.0.0.1:3080`）。所以 Launcher 用同一份密钥签出的
+cookie，那个「你自己在终端起的」server 会照样接受——DSH 并不区分「签发它的那个进程」。
+
+这不是绕过认证：Launcher 读的是同一个用户的、同一个文件的、同一把密钥。
+它**只读不写**，绝不碰 DSH 自己管的凭据文档。
+
+#### 为什么必须这么做
+
+因为 DSH 的**运行态是每进程各自的内存**。如果 Launcher 因为认证不上而另起一个
+server，就会出现两个 server、两份内存态：app 窗口和浏览器窗口看起来"不同步"。
+接管既有 server 才能让两边是**同一个 harness、同一份会话状态**。
+
+回退仍然保留：端口被非 DSH 进程占用、凭据文档缺失或损坏、或你把
+`adoptExistingServer` 关掉时，才会自起一个私有 server——并在日志里明确警告
+「此时 app 与 3080 上的浏览器不会共享会话状态」。
 
 ---
 
@@ -95,7 +113,7 @@ AppKit 自动让它拖窗口、双击缩放，不需要改 DSH 一行 CSS。
 | 字段 | 默认 | 含义 |
 |---|---|---|
 | `preferredPort` | `3080` | 首选端口，和 DSH 默认一致 |
-| `adoptExistingServer` | `true` | 3080 上已有 DSH 且 cookie 可用时直接接管 |
+| `adoptExistingServer` | `true` | 3080 上已有 DSH 时接管它（**app 与浏览器同步的关键**） |
 | `stopServerOnQuit` | `true` | 退出 App 时关掉**它自己启动的** server |
 | `externalLinksInBrowser` | `true` | 外部链接交给系统浏览器，不在窗口里打开 |
 | `windowWidth` / `windowHeight` | `1280` / `880` | 首次窗口尺寸 |
@@ -122,6 +140,7 @@ Sources/DSHLauncher/
   main.swift                 入口 + 菜单栏
   MainWindowController.swift 窗口、WKWebView、导航策略、JS 弹窗
   ServerController.swift     找 dsh、起进程、读 stdout、探测/接管、退出清理
+  BrowserCookie.swift        用共享激活密钥签 DSH 会话 cookie（接管 3080 的关键）
   Preferences.swift          JSON 设置 + 日志
 Resources/Info.plist         bundle 元数据（含 NSAllowsLocalNetworking）
 Assets/icon-1024.png         图标母版，其余尺寸由 build-app.sh 用 sips 派生

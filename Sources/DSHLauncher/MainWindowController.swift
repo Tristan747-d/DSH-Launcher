@@ -144,9 +144,12 @@ final class MainWindowController: NSWindowController {
                 self.statusLabel.stringValue = "正在加载界面…"
                 self.webView.load(URLRequest(url: url))
             case .success(.adopted(let port)):
-                Log.write("loading harness on port \(port) (adopted server, cookie auth)")
+                Log.write("loading harness on port \(port) (adopted server)")
                 self.statusLabel.stringValue = "正在连接已在运行的 DSH…"
-                self.webView.load(URLRequest(url: URL(string: "http://127.0.0.1:\(port)/")!))
+                // A minted cookie must land in WebKit's store *before* the first
+                // navigation, otherwise the load hits the 401 fence and the
+                // window shows an authentication error instead of the harness.
+                self.installPendingCookieThenLoad(port: port)
             case .failure(let error):
                 let body = (error as? LauncherError)?.localizedBody ?? error.localizedDescription
                 Log.write("startup failed: \(body)")
@@ -157,12 +160,12 @@ final class MainWindowController: NSWindowController {
 
     /// Ask WebKit's cookie store for `dsh-auth-…` and try it against `port`.
     ///
-    /// This runs before the app adopts a server it did not start. It is a plain
-    /// loopback request carrying the saved cookie: the harness answers 200 when
-    /// the cookie is valid and 401 when it is not, so the answer is the server's
-    /// own rather than a guess. A hand-started server mints a different process
-    /// token, so its cookie will not match — exactly why this probe exists
-    /// instead of assuming adoption is safe.
+    /// This is the cheap path: one loopback request carrying the cookie already
+    /// saved in the app's WebKit store. The harness answers 200 when the cookie
+    /// is valid and 401 when it is not, so the answer is the server's own rather
+    /// than a guess. When it fails, `ServerController` mints a fresh cookie from
+    /// the shared activation secret rather than falling back to a second server,
+    /// because a second server would split the harness's in-memory state.
     private func probeCookie(on port: Int, done: @escaping (Bool) -> Void) {
         webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
             let relevant = cookies.filter { $0.name.hasPrefix("dsh-auth-") }
@@ -177,6 +180,47 @@ final class MainWindowController: NSWindowController {
                 let ok = status == 200 || status == 303
                 DispatchQueue.main.async { done(ok) }
             }.resume()
+        }
+    }
+
+    /// Seed WebKit's cookie store with the cookie minted for an adopted server,
+    /// then navigate. This is what makes the app and a browser pointed at the
+    /// same server show the *same* harness session.
+    private func installPendingCookieThenLoad(port: Int) {
+        let target = URL(string: "http://127.0.0.1:\(port)/")!
+
+        guard let pending = controller.pendingCookie else {
+            // No minted cookie needed: the stored one already authenticated.
+            webView.load(URLRequest(url: target))
+            return
+        }
+
+        // The header is `name=value`; split on the first `=` only, since the
+        // value is dotted base64url and may itself contain no `=`.
+        let parts = pending.header.split(separator: "=", maxSplits: 1,
+                                        omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let cookie = HTTPCookie(properties: [
+                  .domain: "127.0.0.1",
+                  .path: "/",
+                  .name: String(parts[0]),
+                  .value: String(parts[1]),
+                  .secure: "FALSE",
+              ])
+        else {
+            webView.load(URLRequest(url: target))
+            return
+        }
+
+        // A session cookie with no expiry is deliberate: DSH treats the signed
+        // payload's own `expiresAt` as authoritative, so the signature carries
+        // the real lifetime and WebKit need not duplicate it.
+        let name = cookie.name
+        webView.configuration.websiteDataStore.httpCookieStore.setCookie(cookie) { [weak self] in
+            DispatchQueue.main.async {
+                Log.write("installed browser-session cookie \(name) for \(pending.authority)")
+                self?.webView.load(URLRequest(url: target))
+            }
         }
     }
 
